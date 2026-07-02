@@ -11,6 +11,36 @@ else:
 type SomeTable*[K, V] = Table[K, V] | OrderedTable[K, V]
 type SomeSet[A] = set[A] | HashSet[A] | OrderedSet[A]
 
+type FlattyError* = object of CatchableError ##\
+  ## Raised when a buffer is malformed or hostile: a length prefix that is
+  ## negative, truncated, or claims more elements than the remaining bytes can
+  ## hold. Decoders validate every length before the `setLen`/`copyMem`/loop it
+  ## drives, so decoding untrusted input (e.g. bytes off the network) rejects
+  ## the buffer with a catchable error instead of over-allocating or reading out
+  ## of bounds. A subtype of `CatchableError`, so existing `except CatchableError`
+  ## handlers at trust boundaries catch it.
+
+proc readLen(s: string, i: var int, elemSize: int): int {.inline.} =
+  ## Read a flatty length prefix at `i` and validate it against what's actually
+  ## present, before any caller allocates or copies based on it. Requires 8
+  ## bytes for the prefix itself; rejects negative counts and any count whose
+  ## `elemSize`-byte elements would exceed the bytes that remain. `elemSize` is
+  ## the exact per-element wire size for fixed-width payloads (1 for a string's
+  ## bytes, `sizeof(T)` for a copyMem seq) and a conservative 1 for
+  ## element-wise-decoded collections (whose elements each consume >=1 byte, so
+  ## the real count can't exceed the remaining bytes either). The division form
+  ## avoids overflow in `count * elemSize`.
+  if i < 0 or i + 8 > s.len:
+    raise newException(FlattyError, "flatty: truncated length prefix")
+  let n = s.readInt64(i)
+  i += 8
+  if n < 0:
+    raise newException(FlattyError, "flatty: negative length in buffer")
+  let remaining = (s.len - i).int64
+  if elemSize > 0 and n > remaining div elemSize:
+    raise newException(FlattyError, "flatty: length exceeds remaining buffer")
+  n.int
+
 # Forward declarations.
 proc toFlatty*[T](s: var string, x: seq[T])
 proc toFlatty*(s: var string, x: object)
@@ -141,8 +171,7 @@ proc toFlatty*(s: var string, x: string) =
   s.add(x)
 
 proc fromFlatty*(s: string, i: var int, x: var string) =
-  let len = s.readInt64(i).int
-  i += 8
+  let len = s.readLen(i, 1)
   x = s[i ..< i + len]
   i += len
 
@@ -161,8 +190,14 @@ proc toFlatty*[T](s: var string, x: seq[T]) =
       s.toFlatty(e)
 
 proc fromFlatty*[T](s: string, i: var int, x: var seq[T]) =
-  let len = s.readInt64(i)
-  i += 8
+  # copyMem elements have an exact per-element wire size; element-wise ones
+  # decode >=1 byte each, so 1 is a safe (conservative) lower bound. Either way
+  # the count can't exceed the bytes that remain -- so the setLen/copyMem below
+  # can neither over-allocate nor read past the buffer on hostile input.
+  when not defined(js) and T.supportsCopyMem:
+    let len = s.readLen(i, sizeof(T))
+  else:
+    let len = s.readLen(i, 1)
   x.setLen(len)
   when not defined(js) and T.supportsCopyMem:
     if len > 0:
@@ -217,8 +252,9 @@ proc toTableLike[T](s: var string, K: type, V: type, x: T) {.inline.} =
 proc fromTableLike[T](
     s: string, i: var int, K: type, V: type, x: var T
 ) {.inline.} =
-  let len = s.readInt64(i)
-  i += 8
+  # A key+value pair is >=1 byte on the wire, so the entry count can't exceed
+  # the remaining bytes -- bound the loop before it reads past the buffer.
+  let len = s.readLen(i, 1)
   for _ in 0 ..< len:
     var
       k: K
@@ -255,6 +291,8 @@ proc toFlatty*[N, T](s: var string, x: array[N, T]) =
 proc fromFlatty*[N, T](s: string, i: var int, x: var array[N, T]) =
   when not defined(js) and T.supportsCopyMem:
     if x.len > 0:
+      if i < 0 or i + sizeof(x) > s.len:
+        raise newException(FlattyError, "flatty: truncated array in buffer")
       copyMem(x[0.N].addr, s[i].unsafeAddr, sizeof(x))
       i += sizeof(x)
   else:
@@ -291,8 +329,9 @@ proc toFlatty*[T](s: var string, x: SomeSet[T]) =
     s.toFlatty(e)
 
 proc fromFlatty*[T](s: string, i: var int, x: var SomeSet[T]) =
-  let len = s.readInt64(i).int
-  i += 8
+  # Each element is >=1 byte on the wire, so the count can't exceed the
+  # remaining bytes -- bound the loop before it reads past the buffer.
+  let len = s.readLen(i, 1)
   for j in 0 ..< len:
     var e: T
     s.fromFlatty(i, e)
